@@ -1,0 +1,598 @@
+// COMS20001 - Cellular Automaton Farm - Initial Code Skeleton
+// (using the XMOS i2c accelerometer demo code)
+
+#include <math.h>
+#include <platform.h>
+#include <xs1.h>
+#include <stdio.h>
+#include "pgmIO.h"
+#include "i2c.h"
+
+on tile[0] : in port BUTTONS = XS1_PORT_4E; //port to access xCore-200 buttons
+on tile[0] : out port LEDS = XS1_PORT_4F;   //port to access xCore-200 LEDs
+
+#define  IMHT 64                  //image height
+#define  IMWD 64                  //image width
+#define nb_workers 8               //number of worker nodes
+#define strip_size IMHT/nb_workers //how we split the image
+#define size_char (sizeof(uchar)*8)//size of one uchar in bits
+#define nb_rounds 2                //number of rounds desired
+#define IMWD_ IMWD/size_char       //number of bits in one row of the image
+#define CYCLES_PER_SECOND 100000000 //number of cycles per second
+#define INFRM "64x64.pgm"
+#define OUTFRM "64x64outout.pgm"
+
+typedef unsigned char uchar;      //using uchar as shorthand
+
+on tile[0]: port p_scl = XS1_PORT_1E;         //interface ports to orientation
+on tile[0]: port p_sda = XS1_PORT_1F;
+
+#define FXOS8700EQ_I2C_ADDR 0x1E  //register addresses for orientation
+#define FXOS8700EQ_XYZ_DATA_CFG_REG 0x0E
+#define FXOS8700EQ_CTRL_REG_1 0x2A
+#define FXOS8700EQ_DR_STATUS 0x0
+#define FXOS8700EQ_OUT_X_MSB 0x1
+#define FXOS8700EQ_OUT_X_LSB 0x2
+#define FXOS8700EQ_OUT_Y_MSB 0x3
+#define FXOS8700EQ_OUT_Y_LSB 0x4
+#define FXOS8700EQ_OUT_Z_MSB 0x5
+#define FXOS8700EQ_OUT_Z_LSB 0x6
+
+
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// Read Image from PGM file from path infname[] to channel c_out
+//
+/////////////////////////////////////////////////////////////////////////////////////////
+void DataInStream(char infname[], chanend c_out, chanend c_button, chanend c_leds)
+{
+  int res;
+  uchar line[ IMWD ];
+  uchar val;
+  c_button :> val;
+  if(val){
+      uchar leds = 4;
+      c_leds <: leds; //turn on the green led
+
+      //printf( "DataInStream: Start...\n" );
+
+      //Open PGM file
+      res = _openinpgm( infname, IMWD, IMHT );
+      if( res ) {
+        printf( "DataInStream: Error openening %s\n.", infname );
+        return;
+      }
+
+      //timer t_coding_and_sending;
+      //float start_coding_and_sending, end_coding_and_sending;
+      //t_coding_and_sending :> start_coding_and_sending;
+      //Read image line-by-line and send byte by byte to channel c_out
+      for( int y = 0; y < IMHT; y++ ) {
+        _readinline( line, IMWD );
+        for( int x = 0; x < IMWD; x++ ) {
+            uchar to_send = 0;//preparing message to send
+            for(int i = 0; i < size_char && x < IMWD;i++){
+                //printf( "-%4.1d ", line[x] ); //show image values
+                if(line[x] == 255)
+                    to_send = to_send + (2 << (size_char-i-2));//coding 255 to bits with value 1 in uchar
+                x++;
+            }
+            x--;//to take into consideration the entry that did not fit in the message
+          c_out <: to_send;
+        }
+        //printf( "\n" );
+      }
+
+      //t_coding_and_sending :> end_coding_and_sending;
+      //printf("time elapsed for datainstream to code and send to distributor: %f\n", (end_coding_and_sending-start_coding_and_sending)/(float)CYCLES_PER_SECOND);
+
+      //Close PGM image file
+      _closeinpgm();
+      //printf( "DataInStream: Done...\n" );
+      leds = 0;
+      c_leds <: leds; //turn off the leds
+  }
+  return;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// Start your implementation by changing this function to implement the game of life
+// by farming out parts of the image to worker threads who implement it...
+// Currently the function just inverts the image
+//
+/////////////////////////////////////////////////////////////////////////////////////////
+void distributor(chanend c_in, chanend c_out, chanend c_workers[nb_workers], chanend fromAcc, chanend c_button, chanend c_leds)
+{
+  uchar val;//value to receive from workers
+  int serving = 1;
+  uchar leds = 0;//value to send to the thread handling leds
+  //Starting up and wait for tilting of the xCore-200 Explorer
+  //printf( "ProcessImage: Start, size = %dx%d\n", IMHT, IMWD );
+  //printf( "Waiting for Board Tilt...\n" );
+  fromAcc :> int value;
+
+  //read in each strip of the image and send each one to the relevent worker
+  //printf( "Processing...\n" );
+  //uchar activate = 1;
+  //c_timer <: activate;
+  for(int i = 0; i < nb_workers; i++){
+      for(int y = i*strip_size; y < (i+1)*strip_size; y++){
+          if(y % 2 == 0)
+              leds = 4;//activate green led
+          else
+              leds = 5;//activate green led and independent green led
+          c_leds <: leds;
+          for(int x = 0; x < IMWD_; x++){
+              c_in :> val;
+              c_workers[i] <: val;
+          }
+      }
+  }
+  leds = 0;
+  c_leds <: leds;//turn off leds after image is processed
+  //uchar workers_done = 0;
+  //loop to keep distributor alive as long as the workers need him
+  while(serving){
+      //keep the workers working until we receive an output request
+      uchar work = 0;
+      for(int i = 0; i < nb_workers;i++)
+          c_workers[i] <: work;
+      uchar val = 0;
+      //uchar done = 0;
+      select {
+          case c_button :> val: {//button has been pressed to export image
+              if(val == 1){
+                  leds = 2;
+                  c_leds <: leds;//light up blue led to show that image is being exported
+                  //tell each worker to export their part of the image
+                  for(int i = 0; i < nb_workers; i++){
+                      uchar valToWorkrs = 1;
+                      c_workers[i] <: valToWorkrs;
+                  }
+                  //receive the part of the image from each worker in the correct order and send them over to the output stream
+                  for(int j = 0; j < nb_workers; j++){
+                      for( int y = 0; y < strip_size; y++ ) {//go through all lines
+                        for( int x = 0; x < IMWD_; x++ ) { //go through each uchar in each line
+                            c_workers[j] :> val;//receive the changes needed in the cells
+                            c_out <: val;//send values to output stream
+                        }
+                      }
+                  }
+
+              }
+              break;
+          }
+          /*
+          case c_workers[int j] :> done:
+              printf("here\n");
+              if(val == 10){
+                  workers_done++;
+                  if (workers_done == nb_workers){
+                      activate = 0;
+                      c_timer <: activate;
+                      workers_done = 0;
+                  }
+              }
+              break;
+              */
+          default:
+              break;
+      }
+  }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// Seperate function to handle LED requests from all other functions
+//
+/////////////////////////////////////////////////////////////////////////////////////////
+void leds_handler(chanend c_leds[3]){
+    uchar val = 1;
+    int serving = 1;
+    while(serving){
+        select{
+            //for requests from data input stream
+            case c_leds[0] :> val:
+                LEDS <: val;
+                break;
+            //for requests from data output stream
+            case c_leds[1] :> val:
+                LEDS <: val;
+                break;
+            //for requests from distributor
+            case c_leds[2] :> val:
+                LEDS <: val;
+                break;
+        }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// Function handling button requests
+//
+/////////////////////////////////////////////////////////////////////////////////////////
+void button_listener(chanend c_buttons[3]){
+    uchar val = 1;
+
+    int buttonSW1 = 0, r;
+    while(buttonSW1 == 0) { //waits button SW1 to be pressed before reading the image
+        BUTTONS when pinseq(15)  :> r;    // check that no button is pressed
+        BUTTONS when pinsneq(15) :> r;    // check if some buttons are pressed
+        if (r==14){    //button SW1 pressed
+            c_buttons[0] <: val;
+            break;
+        }
+
+    }
+
+    int buttonSW2 = 0;
+        while(1){ //reads the button infinite times
+            while(buttonSW2 == 0) { //waits button SW2 to be pressed
+                BUTTONS when pinseq(15)  :> r;    // check that no button is pressed
+                BUTTONS when pinsneq(15) :> r;    // check if some buttons are pressed
+                if (r==13){    //button SW2 pressed
+                    c_buttons[1] <: val;
+                    c_buttons[2] <: val;
+                    break;
+                }
+            }
+        }
+}
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// Worker function handling part of the image
+//
+/////////////////////////////////////////////////////////////////////////////////////////
+void worker(chanend c_distributor, chanend nextWorker, chanend prevWorker, int id){
+
+
+    //storing the state of two strips each with two additional rows, one for the current state and one for the next state (which is being computed)
+    uchar image_state [strip_size+2][IMWD_],new_image_state [strip_size+2][IMWD_];
+    uchar val;//used for receiving output requests from distributor
+    int serving = 1;
+    int overflows = 0;
+    int count_ovflws = 1;
+    timer t_work;//timer used to time how long 100 cycles take
+    uint32_t start_work, end_work = 0;//variables to store time
+    for(int y = 1; y < strip_size+1; y++ ) {   //go through all lines
+      for( int x = 0; x < IMWD_; x++ ) { //go through each pixel per line
+          c_distributor :> image_state[y][x];//save image state
+          if(y == 1 && x == 0)
+              t_work :> start_work;//start timer as soon as first part of the image is received
+          new_image_state[y][x] = image_state[y][x];//initialize the new image state too
+      }
+    }
+
+    int counter = 0;//counter used to count 100 cycles
+
+    //keep updating relevent rows for as long as needed
+    while(serving){
+        counter++;
+
+      //  if(counter < 2){
+            //timer t_wrk_com;
+            //uint32_t start_wrk_com, end_wrk_com;
+            //t_wrk_com :> start_wrk_com;
+        //updating the relevant rows that were computed by neighbouring workers
+        if(id % 2 == 0){
+            for(int i = 0; i < IMWD_; i++){
+                prevWorker <: image_state[1][i];
+            }
+            for(int l = 0; l < IMWD_; l++){
+                nextWorker <: image_state[strip_size][l];
+            }
+            for(int k = 0; k < IMWD_; k++){
+                prevWorker :> image_state[0][k];
+            }
+            for(int j = 0; j < IMWD_; j++){
+                nextWorker :> image_state[strip_size+1][j];
+            }
+        }
+        else {
+            for(int j = 0; j < IMWD_; j++){
+                nextWorker :> image_state[strip_size+1][j];
+
+            }
+            for(int k = 0; k < IMWD_; k++){
+                prevWorker :> image_state[0][k];
+            }
+            for(int l = 0; l < IMWD_; l++){
+                nextWorker <: image_state[strip_size][l];
+            }
+            for(int i = 0; i < IMWD_; i++){
+                prevWorker <: image_state[1][i];
+            }
+        }
+        //t_wrk_com :> end_wrk_com;
+        //printf("time elapsed for communication between workers is: %d\n", (end_wrk_com-start_wrk_com)/1000000);
+
+        //timer t_comp;
+      //  uint32_t start_comp, end_comp;
+        //t_comp :> start_comp;
+        for( int y = 1; y < strip_size+1; y++ ) {   //go through all lines excluding first and last
+            for( int x = 0; x < IMWD_; x++ ) { //go through each uchar per line
+
+                int up = (y-1+IMHT)%IMHT;//index for upper uchar
+                int down = (y+1)%IMHT;//index for uchar below
+                int left = (x-1+IMWD_)%IMWD_;//index for left uchar
+                int right = (x+1)%IMWD_;//index for right uchar
+                uchar cell_state = image_state[y][x];//initial value for current uchar
+
+                for(int j = 0; j < 8; j++){
+
+                    uchar live_neighbours = 0;
+                    //count the number of live neighbours
+
+                    //seeing if upper neighbour is alive
+                    if((image_state[up][x] & (1<<(size_char-j-1))) == (1<<(size_char-j-1)))
+                        live_neighbours++;
+
+                    //seeing if below neighbour is alive
+                    if((image_state[down][x] & (1<<(size_char-j-1))) == (1<<(size_char-j-1)))
+                        live_neighbours++;
+
+                    //seeing if left neighbours are alive (direct left, then below-left, then upper-left)
+                    if(j == 0){
+                        if((image_state[y][left] << (size_char-1)) == 128)//for corner cells neighbour is in left uchar
+                            live_neighbours++;
+                        if((image_state[down][left] << (size_char-1)) == 128)//for corner cells neighbour is in below-left uchar
+                            live_neighbours++;
+                        if((image_state[up][left] << (size_char-1)) == 128)//for corner cells neighbour is in upper-left uchar
+                            live_neighbours++;
+                    }
+                    else{
+                        if((cell_state & (1<<(size_char-j))) == (1<<(size_char-j)))//for non-corner cells neighbour is in same uchar
+                            live_neighbours++;
+                        if((image_state[up][x] & (1<<(size_char-j))) == (1<<(size_char-j)))//for non-corner cells neighbour is in same uchar
+                            live_neighbours++;
+                        if((image_state[down][x] & (1<<(size_char-j))) == (1<<(size_char-j)))//for non-corner cells neighbour is in same uchar
+                            live_neighbours++;
+                    }
+
+                    //seeing if right neighbour is alive (direct right, upper-right, below-right)
+                    if(j == 7){
+                        if((image_state[y][right] >> (size_char-1)) == 1)//for corner cell neighbour is in right uchar
+                            live_neighbours++;
+                        if((image_state[up][right] >> (size_char-1)) == 1)//for corner cell neighbour is in upper-right uchar
+                            live_neighbours++;
+                        if((image_state[down][right] >> (size_char-1)) == 1)//for corner cell neighbour is in below-right uchar
+                            live_neighbours++;
+                    }
+                    else{
+                        if((cell_state & (1<<(size_char-j-2))) == (1<<(size_char-j-2)))//for non-corner cell neighbour is in same uchar
+                            live_neighbours++;
+                        if((image_state[up][x] & (1<<(size_char-j-2))) == (1<<(size_char-j-2)))//for non-corner cell neighbour is in same uchar
+                            live_neighbours++;
+                        if((image_state[down][x] & (1<<(size_char-j-2))) == (1<<(size_char-j-2)))//for non-corner cell neighbour is in same uchar
+                            live_neighbours++;
+                    }
+
+                    //applying the game of life rules
+                    if(((cell_state & (1<<(size_char-j-1))) == (1<<size_char-j-1)) && !(live_neighbours == 2 || live_neighbours == 3)){
+                         new_image_state[y][x] = new_image_state[y][x] & (255 - (1<<(size_char-j-1)));
+                    }
+                    else if (((cell_state & (1<<(size_char-j-1))) == 0) && live_neighbours == 3){
+                        new_image_state[y][x] = new_image_state[y][x] | (1<<(size_char-j-1));
+                    }
+                }
+            }
+         }
+        //update the image state
+        for( int y = 1; y < strip_size+1; y++) {   //go through all lines
+            for( int x = 0; x < IMWD_; x++ ) { //go through each uchar per line
+                image_state[y][x] = new_image_state[y][x];//send the computed uchar's
+            }
+        }
+        //t_comp :> start_comp;
+       // printf("time elapsed for computations: %d\n", (end_comp-start_comp)/1000000);
+        uint32_t temp = 0;
+        t_work :> temp;
+        if(temp < start_work && count_ovflws){
+            overflows++;
+            count_ovflws = 0;
+        }
+        if(temp > start_work)
+            count_ovflws = 1;
+        //write time when 100 cycles are executed
+        //if(counter == 100){
+          if(id == 0){
+            t_work :> end_work;
+            printf("time elapsed for 100 cycles in worker thread: %dms\n", (overflows*4200)+((end_work-start_work)/1000000));
+        }
+
+    //    } else {
+           // printf("we done\n");
+      //  }
+        select {
+            case c_distributor :> val:
+                    //if distributor commands worker to work, we continue as usual
+                    if(val == 0)
+                        break;
+                    //if distributor commands worker to output image
+                    if(val == 1) {
+                        for( int y = 1; y < strip_size+1; y++) {   //go through all lines
+                            for( int x = 0; x < IMWD_; x++ ) { //go through each uchar per line
+                                c_distributor <: new_image_state[y][x];//send the computed uchar's
+                            }
+                        }
+                    }
+                    break;
+
+        }
+
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// Write pixel stream from channel c_in to PGM image file
+//
+/////////////////////////////////////////////////////////////////////////////////////////
+void DataOutStream(char outfname[], chanend c_in, chanend c_leds, chanend c_button)
+{
+  while(1){
+      select {
+          case c_button :> uchar val:
+                  if(val == 1){
+                      int res;
+                      uchar line[ IMWD ];
+                      uchar temp;//temporary value used to decode each uchar
+
+                      //Open PGM file
+                      printf( "DataOutStream: Start...\n" );
+                      res = _openoutpgm( outfname, IMWD, IMHT );
+                      if( res ) {
+                        printf( "DataOutStream: Error opening %s\n.", outfname );
+                        return;
+                      }
+
+                      //Compile each line of the image and write the image line-by-line
+                      for( int y = 0; y < IMHT; y++ ) {
+                        for( int x = 0; x < IMWD; x++ ) {
+                            c_in :> temp;
+                            //decoding each uchar
+                            for(int i = 0; i < size_char; i++){
+                               //decoding each bit
+                               if((temp & (1<<(size_char-i-1))) == (1<<(size_char-i-1)))
+                                   line[x] = 255;
+                               else
+                                   line[x] = 0;
+                               x++;
+                            }
+                            x--;
+                        }
+
+                    _writeoutline( line, IMWD );//writing the decoded value
+                    printf( "DataOutStream: Line written...\n" );
+                  }
+
+                      //Close the PGM image
+                      _closeoutpgm();
+                      printf( "DataOutStream: Done...\n" );
+                      uchar leds = 0;
+                      c_leds <: leds;
+                  }
+                  break;
+      }
+  }
+      return;
+}
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// Handles data input and output (mainly so that the thread of the input stream dies and its core could be used)
+//
+/////////////////////////////////////////////////////////////////////////////////////////
+void data_handler(char infname[], chanend c_out, chanend c_button_in, chanend c_leds_in, char outfname[], chanend c_in, chanend c_leds_out, chanend c_button_out){
+    DataInStream(infname,c_out,c_button_in,c_leds_in);
+    DataOutStream(outfname,c_in,c_leds_out,c_button_out);
+}
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// Timer thread triggered by the distributor
+//
+/////////////////////////////////////////////////////////////////////////////////////////
+void timer_thread(chanend c_dist){
+    uint32_t start, end = 0;
+    uchar activate = 0;
+    timer t;
+    while(1){
+        select{
+            case c_dist :> activate:
+                //if it receives activate request from the distributor it activates
+                if(activate == 1)
+                    t :> start;
+                //if it receives a deactivate request from the distributor, it writes the time and outputs the time elapsed
+                else{
+                    t :> end;
+                    printf("time elapsed is %dms\n",(end-start)/1000000);
+                }
+                break;
+        }
+    }
+
+
+}
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// Initialise and  read orientation, send first tilt event to channel
+//
+/////////////////////////////////////////////////////////////////////////////////////////
+void orientation( client interface i2c_master_if i2c, chanend toDist) {
+
+  i2c_regop_res_t result;
+  char status_data = 0;
+  int tilted = 0;
+
+  // Configure FXOS8700EQ
+  result = i2c.write_reg(FXOS8700EQ_I2C_ADDR, FXOS8700EQ_XYZ_DATA_CFG_REG, 0x01);
+  if (result != I2C_REGOP_SUCCESS) {
+    printf("I2C write reg failed\n");
+  }
+
+  // Enable FXOS8700EQ
+  result = i2c.write_reg(FXOS8700EQ_I2C_ADDR, FXOS8700EQ_CTRL_REG_1, 0x01);
+  if (result != I2C_REGOP_SUCCESS) {
+    printf("I2C write reg failed\n");
+  }
+
+  //Probe the orientation x-axis forever
+  while (1) {
+
+    //check until new orientation data is available
+    do {
+      status_data = i2c.read_reg(FXOS8700EQ_I2C_ADDR, FXOS8700EQ_DR_STATUS, result);
+    } while (!status_data & 0x08);
+
+    //get new x-axis tilt value
+    int x = read_acceleration(i2c, FXOS8700EQ_OUT_X_MSB);
+    //send signal to distributor after first tilt
+    if (!tilted) {
+      if (x>30) {
+        tilted = 1 - tilted;
+        toDist <: 1;
+      }
+    }
+  }
+
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// Orchestrate concurrent system and start up all threads
+//
+/////////////////////////////////////////////////////////////////////////////////////////
+int main(void) {
+
+i2c_master_if i2c[1];               //interface to orientation
+
+chan c_inIO, c_control, c_outIO;    //extend your channel definitions here
+chan c_out_workers [nb_workers];
+chan chan_workers [nb_workers];
+chan c_buttons[3];
+chan c_leds[3];
+
+par {
+    on tile[0]: i2c_master(i2c, 1, p_scl, p_sda, 10);   //server thread providing orientation data
+    on tile[0]: orientation(i2c[0],c_control);        //client thread reading orientation data
+    on tile[0]: data_handler(INFRM, c_inIO, c_buttons[0], c_leds[0],OUTFRM, c_outIO, c_leds[1], c_buttons[2]);//thread to handle input and output of data
+    on tile[0]: distributor(c_inIO, c_outIO, c_out_workers, c_control, c_buttons[1], c_leds[2]);//thread to coordinate work on image
+
+    //worker threads
+    on tile[1]: worker(c_out_workers[0], chan_workers[0], chan_workers[7],0);
+    on tile[1]: worker(c_out_workers[1], chan_workers[1], chan_workers[0],1);
+    on tile[1]: worker(c_out_workers[2], chan_workers[2], chan_workers[1],2);
+    on tile[1]: worker(c_out_workers[3], chan_workers[3], chan_workers[2],3);
+    on tile[1]: worker(c_out_workers[4], chan_workers[4], chan_workers[3],4);
+    on tile[1]: worker(c_out_workers[5], chan_workers[5], chan_workers[4],5);
+    on tile[1]: worker(c_out_workers[6], chan_workers[6], chan_workers[5],6);
+    on tile[1]: worker(c_out_workers[7], chan_workers[7], chan_workers[6],7);
+
+    on tile[0]: button_listener(c_buttons);//thread to listen if button is pressed
+    on tile[0]: leds_handler(c_leds);//thread to light up leds if needed
+    //on tile[0]: timer_thread(c_timer);
+    }
+
+  return 0;
+}
