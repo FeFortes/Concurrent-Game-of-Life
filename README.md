@@ -11,7 +11,7 @@ Implementation of a multi-threaded program on the xCore-200 Explorer board which
 visualise aspects of the game. The game matrix is initialised
 from a PGM image file and the user can export the
 game matrix as PGM image files. The solution makes efficient
-and effective use of the available parallel hardware of the
+and effective use of the available parallel hardware of the xCore-200
 architecture by implementing farming
 communication of parts of the game matrix across several
 cores/tiles based on message passing.
