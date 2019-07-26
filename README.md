@@ -22,5 +22,5 @@ cores/tiles based on message passing.
 **COMS20001/GameOfLifeReport.pdf** is divided in 3 sections, containing information such as: 
 
 * Functionality and Design
-* Experiments: time measurements as a function of the number of workers, how they are distributed between the tiles and the image size (to execute 100 cycles of the game of life). The results are interpreted analysed in detail.
+* Experiments: time measurements as a function of the number of workers, how they are distributed between the tiles and the image size (to execute 100 cycles of the game of life). The results are interpreted and analysed in detail.
 * Critical analysis: performance of the system and ways to improve it
